@@ -6,8 +6,18 @@ Minimal Flask application exposing a REST API under ``/api/travelers``.
 import os
 from datetime import date, datetime
 
+from dotenv import load_dotenv
 from flask import Flask, jsonify, request, send_file
 from flask_cors import CORS
+
+# Load environment variables (.env)
+load_dotenv()
+backend_env = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+if os.path.exists(backend_env):
+    load_dotenv(backend_env)
+root_env = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+if os.path.exists(root_env):
+    load_dotenv(root_env)
 
 from database import db
 from errors import ValidationError, register_error_handlers
@@ -290,11 +300,15 @@ def download_logs():
 
 
 # ---------------------------------------------------------------------------
-# Passport MRZ & Profile Photo Extraction Endpoint
+# Passport Extraction & Profile Photo Cropping Endpoint (Gemini 2.5 Flash)
 # ---------------------------------------------------------------------------
+ALLOWED_PASSPORT_EXTENSIONS = {".jpg", ".jpeg", ".png", ".webp", ".pdf"}
+MAX_PASSPORT_FILE_SIZE = 20 * 1024 * 1024  # 20 MB
+
+
 @app.post("/api/passport/extract")
 def extract_passport():
-    """Extract passport biographical details and face portrait from an uploaded file."""
+    """Extract passport biographical details and face portrait using Gemini 2.5 Flash."""
     from passport_extractor import process_passport_file
 
     file_bytes = None
@@ -329,6 +343,23 @@ def extract_passport():
             "error": "No passport file uploaded. Please upload a passport image (JPG, PNG, WebP) or PDF."
         }), 400
 
+    # Validate file extension if filename is provided
+    if filename:
+        ext = os.path.splitext(filename)[1].lower()
+        if ext and ext not in ALLOWED_PASSPORT_EXTENSIONS:
+            return jsonify({
+                "success": False,
+                "error": f"Unsupported file type '{ext}'. Allowed formats: JPG, PNG, WEBP, PDF."
+            }), 400
+
+    # Validate file size limit
+    if len(file_bytes) > MAX_PASSPORT_FILE_SIZE:
+        size_mb = len(file_bytes) / (1024 * 1024)
+        return jsonify({
+            "success": False,
+            "error": f"File size ({size_mb:.1f} MB) exceeds maximum allowed limit of 20 MB."
+        }), 400
+
     try:
         data = process_passport_file(file_bytes, filename=filename)
         app.logger.info("Extracted passport data: doc=%s, name=%s %s",
@@ -338,17 +369,23 @@ def extract_passport():
             "data": data,
         })
     except ValueError as val_err:
-        app.logger.warning("Passport extraction failed: %s", str(val_err))
+        app.logger.warning("Passport extraction validation error: %s", str(val_err))
         return jsonify({
             "success": False,
             "error": str(val_err),
         }), 400
+    except RuntimeError as r_err:
+        app.logger.error("Passport extraction runtime error: %s", str(r_err))
+        return jsonify({
+            "success": False,
+            "error": str(r_err),
+        }), 502
     except Exception as exc:
         app.logger.error("Unexpected error in passport extraction: %s", str(exc))
         return jsonify({
             "success": False,
-            "error": "MRZ could not be parsed. Please upload a clear, uncropped photo of the passport page.",
-        }), 400
+            "error": f"Passport extraction failed: {str(exc)}",
+        }), 500
 
 
 # ---------------------------------------------------------------------------

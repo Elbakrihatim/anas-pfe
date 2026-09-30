@@ -123,6 +123,7 @@ export default function TravelerForm({ traveler, onSave, onCancel }) {
   // Automated Passport Scanner states
   const [scannerDragActive, setScannerDragActive] = useState(false);
   const [scanningPassport, setScanningPassport] = useState(false);
+  const [scannedFilename, setScannedFilename] = useState("");
   const [scanError, setScanError] = useState("");
   const [scanSuccess, setScanSuccess] = useState("");
   const passportScannerInputRef = useRef(null);
@@ -229,6 +230,13 @@ export default function TravelerForm({ traveler, onSave, onCancel }) {
         const d = result.data;
         const composedName = [d.firstName, d.lastName].filter(Boolean).join(" ").trim();
 
+        // Normalize gender to match form select options
+        let genderVal = d.gender || "";
+        const gUpper = genderVal.toUpperCase();
+        if (gUpper === "M" || gUpper === "MALE") genderVal = "Male";
+        else if (gUpper === "F" || gUpper === "FEMALE") genderVal = "Female";
+        else if (gUpper === "X" || gUpper === "NON-BINARY" || gUpper === "OTHER") genderVal = "Non-binary";
+
         setForm((prev) => ({
           ...prev,
           full_name: composedName || prev.full_name,
@@ -236,20 +244,21 @@ export default function TravelerForm({ traveler, onSave, onCancel }) {
           passport_country: d.issuingCountry || d.nationality || prev.passport_country,
           nationality: d.nationality || prev.nationality,
           date_of_birth: d.birthDate || prev.date_of_birth,
+          passport_issue_date: d.issueDate || d.dateOfIssue || prev.passport_issue_date,
           passport_expiry: d.expirationDate || prev.passport_expiry,
-          gender: d.gender || prev.gender,
+          gender: genderVal || prev.gender,
           passport_photo: d.avatarUrl || prev.passport_photo,
         }));
 
         setScanSuccess(
-          `Passport successfully extracted for ${composedName || d.documentNumber}! Identity details and official photo autofilled.`
+          `Passport successfully extracted for ${composedName || d.documentNumber}! Personal details and cropped portrait avatar autofilled.`
         );
       } else {
-        throw new Error(result.error || "MRZ could not be parsed.");
+        throw new Error(result.error || "Failed to extract passport details.");
       }
     } catch (err) {
       setScanError(
-        err.message || "MRZ could not be parsed. Please upload a clear, uncropped photo of the passport page."
+        err.message || "Passport could not be extracted. Please upload a clear photo or PDF document."
       );
     } finally {
       setScanningPassport(false);
@@ -310,14 +319,14 @@ export default function TravelerForm({ traveler, onSave, onCancel }) {
               <ScanLine size={20} />
             </span>
             <div>
-              <h3 className="autofill-title">Instant Passport Autofill</h3>
+              <h3 className="autofill-title">AI-Powered Passport Extraction</h3>
               <p className="autofill-subtitle">
-                Upload your passport page to automatically extract biographical details and portrait photo.
+                Upload your passport page to automatically extract personal details and portrait photo with Gemini Vision.
               </p>
             </div>
           </div>
           <span className="autofill-engine-badge">
-            <Sparkles size={13} className="inline-icon" /> Local ICAO Doc 9303 MRZ Engine
+            <Sparkles size={13} className="inline-icon" /> Google Gemini 2.5 Flash Vision
           </span>
         </div>
 
@@ -353,8 +362,8 @@ export default function TravelerForm({ traveler, onSave, onCancel }) {
               <div className="scanner-laser-line" aria-hidden="true" />
               <Loader2 size={32} className="spin-icon scanner-spinner" aria-hidden="true" />
               <div className="scanner-status-text">
-                <strong>Scanning Passport Document…</strong>
-                <span>Extracting ICAO Machine Readable Zone (MRZ) & cropping portrait portrait</span>
+                <strong>Reading passport with Gemini Vision…</strong>
+                <span>Extracting personal details and cropping portrait avatar</span>
               </div>
             </div>
           ) : (
@@ -368,7 +377,7 @@ export default function TravelerForm({ traveler, onSave, onCancel }) {
                   <strong>Click to upload</strong> or drag & drop passport document
                 </span>
                 <span className="scanner-formats">
-                  Supports PDF document, JPG, PNG, or WebP scans · Local in-process deterministic OCR
+                  Supports PDF document, JPG, PNG, or WebP scans · Powered by Google Gemini 2.5 Flash
                 </span>
               </div>
               <button

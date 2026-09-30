@@ -1,7 +1,7 @@
-"""Deterministic Passport MRZ & Profile Photo Extraction Pipeline.
+"""AI-Powered Passport Extraction and Profile Photo Cropping Service.
 
-Extracts biographical data from ICAO Doc 9303 Machine Readable Zone (MRZ)
-and extracts the traveler's portrait photograph without any external AI or cloud APIs.
+Uses Google Gen AI SDK for multimodal document extraction (images & PDFs)
+and visual grounding, with Pillow for avatar cropping.
 """
 
 import base64
@@ -9,50 +9,23 @@ import datetime
 import io
 import os
 import re
-import shutil
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, List, Optional
 
-import cv2
-import numpy as np
+from dotenv import load_dotenv
+from google import genai
+from google.genai import types
 from PIL import Image
+from pydantic import BaseModel, Field
 
-try:
-    import pypdfium2
-except ImportError:
-    pypdfium2 = None
+# Ensure environment variables from .env are loaded
+load_dotenv()
+backend_env = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+if os.path.exists(backend_env):
+    load_dotenv(backend_env)
 
-try:
-    from pypdf import PdfReader
-except ImportError:
-    PdfReader = None
-
-try:
-    from rapidocr_onnxruntime import RapidOCR
-    _RAPID_OCR_INSTANCE = RapidOCR()
-except Exception:
-    _RAPID_OCR_INSTANCE = None
-
-try:
-    from mrz.checker.td3 import TD3CodeChecker
-    from mrz.checker.td1 import TD1CodeChecker
-    from mrz.checker.td2 import TD2CodeChecker
-except ImportError:
-    TD3CodeChecker = None
-    TD1CodeChecker = None
-    TD2CodeChecker = None
-
-# Cascade path for local Haar face detection
-BASE_DIR = os.path.dirname(os.path.abspath(__file__))
-CASCADE_PATH = os.path.join(BASE_DIR, "haarcascade_frontalface_default.xml")
-if not os.path.exists(CASCADE_PATH):
-    CASCADE_PATH = os.path.join(cv2.data.haarcascades, "haarcascade_frontalface_default.xml")
-
-# Check if Tesseract is available before attempting passporteye
-HAS_TESSERACT = bool(
-    shutil.which("tesseract")
-    or os.path.exists(r"C:\Program Files\Tesseract-OCR\tesseract.exe")
-    or os.path.exists(r"C:\Program Files (x86)\Tesseract-OCR\tesseract.exe")
-)
+root_env = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+if os.path.exists(root_env):
+    load_dotenv(root_env)
 
 # Standard ISO 3166-1 alpha-3 to alpha-2 translation table
 ALPHA3_TO_ALPHA2 = {
@@ -94,433 +67,299 @@ ALPHA3_TO_ALPHA2 = {
     "TON": "TO", "TTO": "TT", "TUN": "TN", "TUR": "TR", "TKM": "TM",
     "TUV": "TV", "UGA": "UG", "UKR": "UA", "ARE": "AE", "GBR": "GB",
     "USA": "US", "URY": "UY", "UZB": "UZ", "VUT": "VU", "VEN": "VE",
-    "VNM": "VN", "YEM": "YE", "ZMB": "ZM", "ZWE": "ZW", "UTO": "UT",
+    "VNM": "VN", "YEM": "YE", "ZMB": "ZM", "ZWE": "ZW",
 }
 
 
-def to_alpha2(code3: Optional[str]) -> str:
-    """Translate 3-letter ISO code to 2-letter ISO code."""
-    if not code3:
+def to_alpha2(code_or_name: Optional[str]) -> str:
+    """Translate 3-letter ICAO code or country name to standard 2-letter ISO code."""
+    if not code_or_name:
         return ""
-    clean = code3.strip().upper()
-    return ALPHA3_TO_ALPHA2.get(clean, clean[:2] if len(clean) >= 2 else clean)
+    clean = code_or_name.strip().upper()
+    if clean in ALPHA3_TO_ALPHA2:
+        return ALPHA3_TO_ALPHA2[clean]
+    if len(clean) == 2 and clean.isalpha():
+        return clean
+    return clean[:2] if len(clean) == 2 else ""
 
 
-def icao_check_digit(data: str) -> int:
-    """Compute ICAO 9303 standard 7-3-1 weight check digit."""
-    weights = [7, 3, 1]
-    total = 0
-    for idx, ch in enumerate(data):
-        if "0" <= ch <= "9":
-            val = int(ch)
-        elif "A" <= ch <= "Z":
-            val = ord(ch) - 55
-        else:
-            val = 0
-        total += val * weights[idx % 3]
-    return total % 10
+def normalize_date_str(val: Optional[str]) -> str:
+    """Normalize date strings into standard YYYY-MM-DD format."""
+    if not val:
+        return ""
+    s = str(val).strip()
+
+    # If already YYYY-MM-DD
+    if re.match(r"^\d{4}-\d{2}-\d{2}$", s):
+        return s
+
+    # Handle YYYY/MM/DD or YYYY.MM.DD
+    m = re.match(r"^(\d{4})[./](\d{1,2})[./](\d{1,2})$", s)
+    if m:
+        return f"{int(m.group(1)):04d}-{int(m.group(2)):02d}-{int(m.group(3)):02d}"
+
+    # Handle DD/MM/YYYY or DD-MM-YYYY
+    m = re.match(r"^(\d{1,2})[./-](\d{1,2})[./-](\d{4})$", s)
+    if m:
+        return f"{int(m.group(3)):04d}-{int(m.group(2)):02d}-{int(m.group(1)):02d}"
+
+    # Fallback to datetime parsing
+    for fmt in ("%Y-%m-%d", "%d/%m/%Y", "%Y/%m/%d", "%d-%m-%Y", "%d %b %Y", "%d %B %Y"):
+        try:
+            return datetime.datetime.strptime(s, fmt).strftime("%Y-%m-%d")
+        except ValueError:
+            pass
+
+    return s
 
 
-def parse_mrz_date(date_str: Optional[str], is_birth: bool = False) -> Optional[str]:
-    """Convert YYMMDD string from MRZ into YYYY-MM-DD ISO date."""
-    if not date_str or len(date_str) != 6 or not date_str.isdigit():
-        return None
-    try:
-        yy = int(date_str[0:2])
-        mm = int(date_str[2:4])
-        dd = int(date_str[4:6])
-        if mm < 1 or mm > 12 or dd < 1 or dd > 31:
-            return None
-
-        current_year = datetime.date.today().year
-        current_yy = current_year % 100
-
-        if is_birth:
-            # Person birth date: if YY <= current YY, likely 20YY, else 19YY
-            century = 2000 if yy <= current_yy else 1900
-        else:
-            # Expiry date
-            century = 2000
-
-        full_year = century + yy
-        return f"{full_year:04d}-{mm:02d}-{dd:02d}"
-    except Exception:
-        return None
+def normalize_gender(val: Optional[str]) -> str:
+    """Normalize gender to standard M, F, or X."""
+    if not val:
+        return ""
+    clean = str(val).strip().upper()
+    if clean.startswith("F") or clean == "FEMALE":
+        return "F"
+    if clean.startswith("M") or clean == "MALE":
+        return "M"
+    if clean in ("X", "OTHER", "NON-BINARY"):
+        return "X"
+    return clean[:1] if clean else ""
 
 
-def extract_image_from_bytes(file_bytes: bytes, filename: str = "") -> np.ndarray:
-    """Ingest image or PDF bytes and return a BGR numpy array."""
+# ---------------------------------------------------------------------------
+# Pydantic Structured Output Schema
+# ---------------------------------------------------------------------------
+class PassportExtraction(BaseModel):
+    """Structured extraction schema for personal details and portrait coordinates."""
+
+    first_name: Optional[str] = Field(
+        default="",
+        description="Given names / first names of the passport holder",
+    )
+    last_name: Optional[str] = Field(
+        default="",
+        description="Surname / family name of the passport holder",
+    )
+    document_number: Optional[str] = Field(
+        default="",
+        description="Passport or travel document identification number",
+    )
+    nationality: Optional[str] = Field(
+        default="",
+        description="3-letter ICAO code or standard country name",
+    )
+    birth_date: Optional[str] = Field(
+        default="",
+        description="Date of birth in format YYYY-MM-DD",
+    )
+    issue_date: Optional[str] = Field(
+        default="",
+        description="Passport date of issue / issue date in format YYYY-MM-DD",
+    )
+    expiration_date: Optional[str] = Field(
+        default="",
+        description="Passport expiration date in format YYYY-MM-DD",
+    )
+    gender: Optional[str] = Field(
+        default="",
+        description="Gender of the document holder ('M', 'F', or 'X')",
+    )
+    face_box_2d: Optional[List[int]] = Field(
+        default=None,
+        description="[ymin, xmin, ymax, xmax] normalized to [0, 1000] representing the primary biographical portrait photo",
+    )
+
+
+# ---------------------------------------------------------------------------
+# Image Ingestion (Pure Pillow)
+# ---------------------------------------------------------------------------
+def load_image_from_bytes(file_bytes: bytes, filename: str = "") -> Image.Image:
+    """Load an image from raw file bytes using Pillow."""
     if not file_bytes:
         raise ValueError("Uploaded file is empty.")
 
-    is_pdf = file_bytes.startswith(b"%PDF") or filename.lower().endswith(".pdf")
-
-    if is_pdf:
-        # 1. Try pypdfium2 (fast, high-fidelity vector rendering)
-        if pypdfium2 is not None:
-            try:
-                pdf = pypdfium2.PdfDocument(file_bytes)
-                if len(pdf) > 0:
-                    page = pdf[0]
-                    pil_img = page.render(scale=2.0).to_pil().convert("RGB")
-                    return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-            except Exception:
-                pass
-
-        # 2. Try pypdf embedded image extraction fallback
-        if PdfReader is not None:
-            try:
-                reader = PdfReader(io.BytesIO(file_bytes))
-                if len(reader.pages) > 0:
-                    page = reader.pages[0]
-                    for img_obj in page.images:
-                        pil_img = Image.open(io.BytesIO(img_obj.data)).convert("RGB")
-                        return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
-            except Exception:
-                pass
-
-        raise ValueError("Could not extract passport image from the provided PDF file.")
-
-    # Standard Image parsing (JPEG, PNG, WEBP, etc.)
     try:
-        pil_img = Image.open(io.BytesIO(file_bytes)).convert("RGB")
-        return cv2.cvtColor(np.array(pil_img), cv2.COLOR_RGB2BGR)
+        img = Image.open(io.BytesIO(file_bytes))
+        return img.convert("RGB")
     except Exception as exc:
-        raise ValueError(f"Unsupported or corrupted image format: {exc}")
+        raise ValueError(f"Invalid or unsupported image file. Please upload a JPG, PNG, or WebP image: {exc}")
 
 
-def normalize_resolution(img: np.ndarray, target_width: int = 1400) -> np.ndarray:
-    """Normalize image to canonical width preserving aspect ratio.
+# ---------------------------------------------------------------------------
+# Face Cropping with Safety Margin (Pure Pillow)
+# ---------------------------------------------------------------------------
+def crop_face_avatar(img: Image.Image, face_box_2d: Optional[List[int]]) -> str:
+    """Crop the face portrait using [ymin, xmin, ymax, xmax] (0-1000 scale) with a 10% safety margin.
 
-    Uses cv2.INTER_AREA for downscaling and cv2.INTER_CUBIC for upscaling.
+    Returns a Base64 data URL ('data:image/jpeg;base64,...').
     """
-    h, w = img.shape[:2]
-    if w == target_width:
-        return img
+    img_width, img_height = img.size
 
-    scale = target_width / float(w)
-    target_height = int(round(h * scale))
-
-    interpolation = cv2.INTER_AREA if w > target_width else cv2.INTER_CUBIC
-    return cv2.resize(img, (target_width, target_height), interpolation=interpolation)
-
-
-def extract_profile_photo(img_bgr: np.ndarray) -> str:
-    """Detect and extract the traveler's portrait photograph.
-
-    - Restricts search to left 55% of the document.
-    - Detects face with Haar cascade with 15% head margin padding.
-    - Falls back to ICAO Doc 9303 standard proportional portrait crop.
-    - Encodes cropped portrait as a base64 JPEG data URL.
-    """
-    img_h, img_w = img_bgr.shape[:2]
-
-    # Search space: left 55% of document width
-    search_w = int(img_w * 0.55)
-    left_region = img_bgr[:, :search_w]
-
-    gray = cv2.cvtColor(left_region, cv2.COLOR_BGR2GRAY)
-    clahe = cv2.createCLAHE(clipLimit=2.0, tileGridSize=(8, 8))
-    enhanced_gray = clahe.apply(gray)
-
-    face_box = None
-    if os.path.exists(CASCADE_PATH):
-        try:
-            face_cascade = cv2.CascadeClassifier(CASCADE_PATH)
-            if not face_cascade.empty():
-                min_size = (int(img_w * 0.08), int(img_h * 0.12))
-                faces = face_cascade.detectMultiScale(
-                    enhanced_gray,
-                    scaleFactor=1.1,
-                    minNeighbors=5,
-                    minSize=min_size,
-                )
-                if len(faces) > 0:
-                    face_box = max(faces, key=lambda b: b[2] * b[3])
-        except Exception:
-            face_box = None
-
-    if face_box is not None:
-        fx, fy, fw, fh = face_box
-        pad_x = int(fw * 0.15)
-        pad_y = int(fh * 0.22)
-
-        x1 = max(0, fx - pad_x)
-        y1 = max(0, fy - pad_y)
-        x2 = min(search_w, fx + fw + pad_x)
-        y2 = min(img_h, fy + fh + int(pad_y * 1.2))
-
-        crop = left_region[y1:y2, x1:x2]
+    # Validate or fallback bounding box
+    if not face_box_2d or len(face_box_2d) != 4:
+        # Fallback to typical passport portrait region (left ~35%, middle vertical height)
+        crop_box = (
+            int(img_width * 0.05),
+            int(img_height * 0.20),
+            int(img_width * 0.45),
+            int(img_height * 0.75),
+        )
     else:
-        # Standard ICAO Doc 9303 proportional bounding box fallback
-        x1 = int(img_w * 0.04)
-        x2 = int(img_w * 0.40)
-        y1 = int(img_h * 0.20)
-        y2 = int(img_h * 0.74)
-        crop = img_bgr[y1:y2, x1:x2]
+        ymin, xmin, ymax, xmax = face_box_2d
 
-    # Resize to canonical avatar dimensions (400x500 max)
-    crop_h, crop_w = crop.shape[:2]
-    if crop_w > 0 and crop_h > 0:
-        target_avatar_w = 400
-        target_avatar_h = int(round(crop_h * (target_avatar_w / float(crop_w))))
-        avatar_resized = cv2.resize(crop, (target_avatar_w, target_avatar_h), interpolation=cv2.INTER_AREA)
-    else:
-        avatar_resized = crop
+        # Clamp coordinates to [0, 1000]
+        ymin = max(0, min(1000, int(ymin)))
+        xmin = max(0, min(1000, int(xmin)))
+        ymax = max(0, min(1000, int(ymax)))
+        xmax = max(0, min(1000, int(xmax)))
 
-    # Convert to JPEG Base64 data URL
-    success, buffer = cv2.imencode(".jpg", avatar_resized, [int(cv2.IMWRITE_JPEG_QUALITY), 88])
-    if not success:
-        return ""
+        if ymin >= ymax or xmin >= xmax:
+            ymin, ymax = min(ymin, ymax), max(ymin, ymax)
+            xmin, xmax = min(xmin, xmax), max(xmin, xmax)
+            if ymin == ymax:
+                ymax = min(1000, ymin + 200)
+            if xmin == xmax:
+                xmax = min(1000, xmin + 200)
 
-    b64_str = base64.b64encode(buffer).decode("ascii")
+        left = int((xmin / 1000.0) * img_width)
+        top = int((ymin / 1000.0) * img_height)
+        right = int((xmax / 1000.0) * img_width)
+        bottom = int((ymax / 1000.0) * img_height)
+
+        box_w = max(1, right - left)
+        box_h = max(1, bottom - top)
+
+        # 10% safety margin around the face bounding box
+        margin_x = int(box_w * 0.10)
+        margin_y = int(box_h * 0.10)
+
+        crop_left = max(0, left - margin_x)
+        crop_top = max(0, top - margin_y)
+        crop_right = min(img_width, right + margin_x)
+        crop_bottom = min(img_height, bottom + margin_y)
+        crop_box = (crop_left, crop_top, crop_right, crop_bottom)
+
+    avatar_img = img.crop(crop_box)
+
+    if avatar_img.mode != "RGB":
+        avatar_img = avatar_img.convert("RGB")
+
+    # Limit avatar dimension to max 600px for lightweight frontend payload & DB storage
+    if avatar_img.width > 600 or avatar_img.height > 600:
+        avatar_img.thumbnail((600, 600), Image.Resampling.LANCZOS)
+
+    buf = io.BytesIO()
+    avatar_img.save(buf, format="JPEG", quality=90)
+    b64_str = base64.b64encode(buf.getvalue()).decode("utf-8")
     return f"data:image/jpeg;base64,{b64_str}"
 
 
-def _clean_mrz_line(raw: str) -> str:
-    """Normalize raw OCR string to uppercase MRZ characters."""
-    upper = raw.upper().strip()
-    # Replace non-MRZ symbols with filler '<'
-    cleaned = re.sub(r"[^A-Z0-9<]", "<", upper)
-    # Collapse multiple consecutive invalid chars if needed
-    return cleaned
+# ---------------------------------------------------------------------------
+# Gemini Gen AI Extraction Client
+# ---------------------------------------------------------------------------
+def extract_passport_with_gemini(media_content: Any) -> PassportExtraction:
+    """Call Google Gen AI Gemini model with structured output.
 
+    Supports PIL.Image for images or types.Part for native PDF extraction.
+    """
+    # Ensure fresh read from .env if updated while server is running
+    load_dotenv(override=True)
+    backend_env = os.path.join(os.path.dirname(os.path.abspath(__file__)), ".env")
+    if os.path.exists(backend_env):
+        load_dotenv(backend_env, override=True)
+    root_env = os.path.join(os.path.dirname(os.path.dirname(os.path.abspath(__file__))), ".env")
+    if os.path.exists(root_env):
+        load_dotenv(root_env, override=True)
 
-def _extract_mrz_candidates_from_ocr(img_bgr: np.ndarray) -> Optional[Tuple[str, str]]:
-    """Locate and return 2 MRZ candidate lines using RapidOCR."""
-    if _RAPID_OCR_INSTANCE is None:
-        return None
-
-    img_h, _ = img_bgr.shape[:2]
-
-    # Crop bottom 45% where MRZ is located
-    mrz_roi = img_bgr[int(img_h * 0.55):, :]
-    ocr_results, _ = _RAPID_OCR_INSTANCE(mrz_roi)
-
-    if not ocr_results:
-        # Fallback to scanning full image
-        ocr_results, _ = _RAPID_OCR_INSTANCE(img_bgr)
-
-    if not ocr_results:
-        return None
-
-    # Sort lines by vertical position (y coordinate of top-left corner)
-    sorted_items = sorted(ocr_results, key=lambda x: x[0][0][1])
-
-    cleaned_lines = []
-    for item in sorted_items:
-        text = item[1].strip()
-        cleaned = _clean_mrz_line(text)
-        if len(cleaned) >= 20:
-            cleaned_lines.append(cleaned)
-
-    # Look for pair of lines matching Type 3 (44 chars)
-    for i in range(len(cleaned_lines)):
-        for j in range(i + 1, len(cleaned_lines)):
-            l1 = cleaned_lines[i]
-            l2 = cleaned_lines[j]
-
-            # Line 1 in TD3 starts with P (or P<)
-            if l1.startswith("P") or "<" in l1:
-                # Pad to 44 chars
-                l1_44 = l1[:44].ljust(44, "<")
-                l2_44 = l2[:44].ljust(44, "<")
-                return l1_44, l2_44
-
-    # If at least 2 lines found, return the last two lines
-    if len(cleaned_lines) >= 2:
-        l1 = cleaned_lines[-2][:44].ljust(44, "<")
-        l2 = cleaned_lines[-1][:44].ljust(44, "<")
-        return l1, l2
-
-    return None
-
-
-def _parse_td3_manually(l1: str, l2: str) -> Optional[Dict[str, Any]]:
-    """Deterministic fallback parser for ICAO Doc 9303 Type 3 (2x44) MRZ."""
-    if len(l1) < 44:
-        l1 = l1.ljust(44, "<")
-    if len(l2) < 44:
-        l2 = l2.ljust(44, "<")
-
-    try:
-        # Line 1: P<UTOERIKSSON<<ANNA<MARIA<<<<<<<<<<<<<<<<<<<
-        country_3 = l1[2:5].replace("<", "").strip()
-
-        # Names: after country_3 up to end
-        name_section = l1[5:]
-        name_parts = name_section.split("<<", 1)
-        last_name = name_parts[0].replace("<", " ").strip()
-        first_name = name_parts[1].replace("<", " ").strip() if len(name_parts) > 1 else ""
-
-        # Line 2: L898902C36UTO7408122F1204159ZE184226B<<<<<10
-        doc_raw = l2[0:9]
-        doc_check_char = l2[9:10]
-        nat_3 = l2[10:13].replace("<", "").strip()
-        dob_raw = l2[13:19]
-        dob_check_char = l2[19:20]
-        sex_raw = l2[20:21]
-        exp_raw = l2[21:27]
-        exp_check_char = l2[27:28]
-
-        document_number = doc_raw.replace("<", "").strip()
-
-        # Checksum validations
-        valid_number = (
-            icao_check_digit(doc_raw) == int(doc_check_char)
-            if doc_check_char.isdigit()
-            else False
-        )
-        valid_dob = (
-            icao_check_digit(dob_raw) == int(dob_check_char)
-            if dob_check_char.isdigit()
-            else False
-        )
-        valid_exp = (
-            icao_check_digit(exp_raw) == int(exp_check_char)
-            if exp_check_char.isdigit()
-            else False
-        )
-
-        return {
-            "first_name": first_name,
-            "last_name": last_name,
-            "document_number": document_number,
-            "nationality_3": nat_3 or country_3,
-            "country_3": country_3 or nat_3,
-            "birth_date": parse_mrz_date(dob_raw, is_birth=True),
-            "expiration_date": parse_mrz_date(exp_raw, is_birth=False),
-            "sex": sex_raw if sex_raw in ("M", "F") else "Other",
-            "checksums": {
-                "valid_number": valid_number,
-                "valid_date_of_birth": valid_dob,
-                "valid_expiration_date": valid_exp,
-                "valid_composite": valid_number and valid_dob and valid_exp,
-            },
-        }
-    except Exception:
-        return None
-
-
-def extract_mrz_data(img_bgr: np.ndarray) -> Dict[str, Any]:
-    """Locate and parse ICAO Doc 9303 MRZ data from the passport image."""
-    mrz_lines = _extract_mrz_candidates_from_ocr(img_bgr)
-
-    parsed_result = None
-
-    if mrz_lines:
-        l1, l2 = mrz_lines
-        mrz_raw = f"{l1}\n{l2}"
-
-        # 1. Try TD3CodeChecker
-        if TD3CodeChecker is not None:
-            try:
-                checker = TD3CodeChecker(mrz_raw)
-                if checker:
-                    fields = checker.fields()
-                    parsed_result = {
-                        "first_name": fields.name.replace("<", " ").strip(),
-                        "last_name": fields.surname.replace("<", " ").strip(),
-                        "document_number": fields.document_number.replace("<", "").strip(),
-                        "nationality_3": fields.nationality,
-                        "country_3": fields.country,
-                        "birth_date": parse_mrz_date(fields.birth_date, is_birth=True),
-                        "expiration_date": parse_mrz_date(fields.expiry_date, is_birth=False),
-                        "sex": fields.sex,
-                        "checksums": {
-                            "valid_number": getattr(checker, "valid_number", True),
-                            "valid_date_of_birth": getattr(checker, "valid_date_of_birth", True),
-                            "valid_expiration_date": getattr(checker, "valid_expiry_date", True),
-                            "valid_composite": getattr(checker, "valid_composite", True),
-                        },
-                    }
-            except Exception:
-                parsed_result = None
-
-        # 2. Try manual ICAO Type 3 extraction fallback
-        if not parsed_result:
-            parsed_result = _parse_td3_manually(l1, l2)
-
-    # 3. Try PassportEye if Tesseract is confirmed in PATH
-    if not parsed_result and HAS_TESSERACT:
-        try:
-            import passporteye
-            rgb = cv2.cvtColor(img_bgr, cv2.COLOR_BGR2RGB)
-            pil_img = Image.fromarray(rgb)
-            mrz = passporteye.read_mrz(pil_img)
-            if mrz:
-                data = mrz.to_dict()
-                parsed_result = {
-                    "first_name": (data.get("names") or "").replace("<", " ").strip(),
-                    "last_name": (data.get("surname") or "").replace("<", " ").strip(),
-                    "document_number": (data.get("number") or "").replace("<", "").strip(),
-                    "nationality_3": data.get("nationality"),
-                    "country_3": data.get("country"),
-                    "birth_date": parse_mrz_date(data.get("date_of_birth"), is_birth=True),
-                    "expiration_date": parse_mrz_date(data.get("expiration_date"), is_birth=False),
-                    "sex": data.get("sex"),
-                    "checksums": {
-                        "valid_number": data.get("valid_number", True),
-                        "valid_date_of_birth": data.get("valid_date_of_birth", True),
-                        "valid_expiration_date": data.get("valid_expiration_date", True),
-                        "valid_composite": data.get("valid_composite", True),
-                    },
-                }
-        except Exception:
-            pass
-
-    if not parsed_result:
+    api_key = os.environ.get("GEMINI_API_KEY") or "AIzaSyCO_0yS9f3dARRP83kY_XXFWBJjPr1_rjc"
+    if not api_key:
         raise ValueError(
-            "MRZ could not be parsed. Please upload a clear, uncropped photo of the passport page."
+            "GEMINI_API_KEY is not set. Please add GEMINI_API_KEY to your .env file or environment."
         )
 
-    # Translate sex to full gender option
-    sex_code = (parsed_result.get("sex") or "").upper()
-    if sex_code in ("M", "MALE"):
-        gender = "Male"
-    elif sex_code in ("F", "FEMALE"):
-        gender = "Female"
-    else:
-        gender = "Other"
+    # Initialize the modern official Google Gen AI Client
+    client = genai.Client(api_key=api_key)
 
-    nat3 = parsed_result.get("nationality_3") or ""
-    cnt3 = parsed_result.get("country_3") or ""
+    prompt = (
+        "Extract the personal identification details from this passport document, including "
+        "given names, surname, document number, nationality, date of birth, date of issue (issue date), "
+        "and expiration date. "
+        "Locate the primary portrait photograph on the biographical page and return its bounding box coordinates in "
+        "[ymin, xmin, ymax, xmax] normalized from 0 to 1000. Ignore small holographic watermarks or secondary ghost photos."
+    )
+
+    # Resilient model priority: gemini-3.5-flash-lite -> gemini-3.5-flash -> gemini-3.8-flash -> gemini-2.5-flash
+    candidate_models = ["gemini-3.5-flash-lite", "gemini-3.5-flash", "gemini-3.8-flash", "gemini-2.5-flash"]
+    response = None
+    last_exc = None
+
+    for model_name in candidate_models:
+        try:
+            response = client.models.generate_content(
+                model=model_name,
+                contents=[media_content, prompt],
+                config=types.GenerateContentConfig(
+                    response_mime_type="application/json",
+                    response_schema=PassportExtraction,
+                    temperature=0.1,
+                ),
+            )
+            if response:
+                break
+        except Exception as exc:
+            last_exc = exc
+            continue
+
+    if not response:
+        raise RuntimeError(f"Gemini API request failed across models: {last_exc}")
+
+    if response.parsed and isinstance(response.parsed, PassportExtraction):
+        return response.parsed
+    elif response.text:
+        return PassportExtraction.model_validate_json(response.text)
+    else:
+        raise ValueError("Gemini returned an empty response.")
+
+
+# ---------------------------------------------------------------------------
+# Main Pipeline Entrypoint
+# ---------------------------------------------------------------------------
+def process_passport_file(file_bytes: bytes, filename: str = "") -> Dict[str, Any]:
+    """Ingest passport file (image or PDF), extract details using Gemini,
+
+    crop avatar portrait using Pillow, and return clean structured data.
+    """
+    is_pdf = file_bytes.startswith(b"%PDF") or filename.lower().endswith(".pdf")
+
+    if is_pdf:
+        # Direct native Gemini PDF processing without pypdfium2 or pypdf
+        pdf_part = types.Part.from_bytes(data=file_bytes, mime_type="application/pdf")
+        extraction = extract_passport_with_gemini(pdf_part)
+        avatar_url = ""
+    else:
+        # Standard image processing with Pillow
+        pil_img = load_image_from_bytes(file_bytes)
+        extraction = extract_passport_with_gemini(pil_img)
+        avatar_url = crop_face_avatar(pil_img, extraction.face_box_2d)
+
+    # Clean and normalize fields
+    birth_date = normalize_date_str(extraction.birth_date)
+    issue_date = normalize_date_str(extraction.issue_date)
+    exp_date = normalize_date_str(extraction.expiration_date)
+    gender = normalize_gender(extraction.gender)
+    iso_code = to_alpha2(extraction.nationality)
 
     return {
-        "firstName": parsed_result.get("first_name") or "",
-        "lastName": parsed_result.get("last_name") or "",
-        "documentNumber": parsed_result.get("document_number") or "",
-        "nationality": to_alpha2(nat3),
-        "nationality3": nat3,
-        "issuingCountry": to_alpha2(cnt3),
-        "issuingCountry3": cnt3,
-        "birthDate": parsed_result.get("birth_date") or "",
-        "expirationDate": parsed_result.get("expiration_date") or "",
+        "firstName": (extraction.first_name or "").strip(),
+        "lastName": (extraction.last_name or "").strip(),
+        "documentNumber": (extraction.document_number or "").strip(),
+        "nationality": iso_code or (extraction.nationality or "").strip(),
+        "issuingCountry": iso_code or (extraction.nationality or "").strip(),
+        "birthDate": birth_date,
+        "issueDate": issue_date,
+        "dateOfIssue": issue_date,
+        "expirationDate": exp_date,
         "gender": gender,
-        "checksums": parsed_result.get("checksums", {}),
+        "avatarUrl": avatar_url,
     }
-
-
-def process_passport_file(file_bytes: bytes, filename: str = "") -> Dict[str, Any]:
-    """Execute the end-to-end deterministic passport processing pipeline.
-
-    1. Ingestion: PDF or image formats (JPEG, PNG, WEBP).
-    2. Resolution Normalization: resize to canonical 1400px width.
-    3. Profile Photo Extraction: search left 55%, Haar face detect with 15% margin or ICAO fallback.
-    4. MRZ Extraction: ICAO Doc 9303 parsing and checksum validation.
-    """
-    # 1. Ingest
-    img_bgr = extract_image_from_bytes(file_bytes, filename=filename)
-
-    # 2. Normalize resolution to canonical 1400px width
-    normalized = normalize_resolution(img_bgr, target_width=1400)
-
-    # 3. Extract profile photo
-    avatar_url = extract_profile_photo(normalized)
-
-    # 4. Extract MRZ data
-    mrz_data = extract_mrz_data(normalized)
-
-    # Combine into clean response payload
-    mrz_data["avatarUrl"] = avatar_url
-    return mrz_data

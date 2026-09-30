@@ -14,7 +14,7 @@ class Traveler(db.Model):
 
     # Passport & Document Info (beginning of registration)
     passport_number = db.Column(db.String(50), nullable=False, unique=True)
-    passport_country = db.Column(db.String(10), nullable=True)  # ISO 3166-1 alpha-2 code e.g. "ES"
+    passport_country = db.Column(db.String(10), nullable=True)  
     passport_issue_date = db.Column(db.Date, nullable=True)
     passport_expiry = db.Column(db.Date, nullable=True)
     passport_photo = db.Column(db.Text, nullable=True)  # Base64 data URL or image URI
@@ -23,8 +23,7 @@ class Traveler(db.Model):
     full_name = db.Column(db.String(200), nullable=False)
     date_of_birth = db.Column(db.Date, nullable=True)
     gender = db.Column(db.String(20), nullable=True)
-    nationality = db.Column(db.String(10), nullable=True)  # ISO 3166-1 alpha-2 code e.g. "MA", "ES"
-
+    nationality = db.Column(db.String(10), nullable=True)  
     # Contact Details
     email = db.Column(db.String(120), nullable=True)
     phone = db.Column(db.String(50), nullable=True)
