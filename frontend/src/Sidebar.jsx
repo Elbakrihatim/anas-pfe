@@ -1,13 +1,30 @@
-import { LayoutDashboard, Users, UserPlus, FileText, Sun, Moon, Compass } from "lucide-react";
+import { useEffect } from "react";
+import { LayoutDashboard, Users, UserPlus, FileText, Sun, Moon, Compass, X, PlaneTakeoff } from "lucide-react";
 
 const NAV_ITEMS = [
   { id: "dashboard", icon: LayoutDashboard, label: "Dashboard" },
   { id: "travelers", icon: Users, label: "Travelers" },
   { id: "register", icon: UserPlus, label: "Register" },
+  { id: "flights", icon: PlaneTakeoff, label: "Flights" },
   { id: "logs", icon: FileText, label: "Logs" },
 ];
 
 export default function Sidebar({ active, onNavigate, isOpen, onClose, theme, onToggleTheme }) {
+  // Lock body scroll on mobile when sidebar is open & close on Escape
+  useEffect(() => {
+    if (isOpen) {
+      document.body.style.overflow = "hidden";
+      const handleKeyDown = (e) => {
+        if (e.key === "Escape") onClose();
+      };
+      window.addEventListener("keydown", handleKeyDown);
+      return () => {
+        document.body.style.overflow = "";
+        window.removeEventListener("keydown", handleKeyDown);
+      };
+    }
+  }, [isOpen, onClose]);
+
   return (
     <>
       {isOpen && (
@@ -26,6 +43,14 @@ export default function Sidebar({ active, onNavigate, isOpen, onClose, theme, on
               <Compass size={24} />
             </span>
             <h1>TravelDash</h1>
+            <button
+              type="button"
+              className="sidebar-close-btn"
+              onClick={onClose}
+              aria-label="Close navigation menu"
+            >
+              <X size={18} />
+            </button>
           </div>
           <div className="brand-sub">Traveler Registration System</div>
         </div>

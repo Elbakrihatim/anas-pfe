@@ -7,7 +7,7 @@ const API_BASE = "http://localhost:5000/api/travelers";
 async function handleResponse(res) {
   if (!res.ok) {
     const body = await res.json().catch(() => ({}));
-    const msg = body.detail || body.title || res.statusText;
+    const msg = body.detail || body.error || body.message || body.title || res.statusText || "Request failed";
     throw new Error(msg);
   }
   if (res.status === 204) return null;
@@ -75,3 +75,61 @@ export async function extractPassportData(file) {
   return res.json();
 }
 
+/* ── Flights ───────────────────────────────────────────────────────── */
+const FLIGHTS_URL = "http://localhost:5000/api/flights";
+
+export async function fetchFlights() {
+  const res = await fetch(FLIGHTS_URL);
+  return handleResponse(res);
+}
+
+export async function fetchFlight(id) {
+  const res = await fetch(`${FLIGHTS_URL}/${id}`);
+  return handleResponse(res);
+}
+
+export async function createFlight(data) {
+  const res = await fetch(FLIGHTS_URL, {
+    method: "POST",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  return handleResponse(res);
+}
+
+export async function updateFlight(id, data) {
+  const res = await fetch(`${FLIGHTS_URL}/${id}`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify(data),
+  });
+  return handleResponse(res);
+}
+
+export async function deleteFlight(id) {
+  const res = await fetch(`${FLIGHTS_URL}/${id}`, { method: "DELETE" });
+  return handleResponse(res);
+}
+
+export async function assignTravelerToFlight(flightId, travelerId) {
+  const res = await fetch(`${FLIGHTS_URL}/${flightId}/travelers/${travelerId}`, {
+    method: "POST",
+  });
+  return handleResponse(res);
+}
+
+export async function removeTravelerFromFlight(flightId, travelerId) {
+  const res = await fetch(`${FLIGHTS_URL}/${flightId}/travelers/${travelerId}`, {
+    method: "DELETE",
+  });
+  return handleResponse(res);
+}
+
+export async function updateFlightPassengers(flightId, travelerIds) {
+  const res = await fetch(`${FLIGHTS_URL}/${flightId}/passengers`, {
+    method: "PUT",
+    headers: { "Content-Type": "application/json" },
+    body: JSON.stringify({ traveler_ids: travelerIds }),
+  });
+  return handleResponse(res);
+}

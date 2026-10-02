@@ -22,7 +22,7 @@ if os.path.exists(root_env):
 from database import db
 from errors import ValidationError, register_error_handlers
 from logging_config import setup_logging
-from models import Traveler
+from models import Flight, Traveler
 
 # ---------------------------------------------------------------------------
 # App factory-ish setup (kept in module scope for simplicity)
@@ -71,6 +71,190 @@ with app.app_context():
     db.create_all()
     _ensure_columns()
     app.logger.info("TravelDash API started — database at %s", DB_PATH)
+
+
+# ---------------------------------------------------------------------------
+# Flight Routes
+# ---------------------------------------------------------------------------
+
+@app.get("/api/flights")
+def list_flights():
+    """Return all flights with their assigned travelers."""
+    flights = Flight.query.order_by(Flight.departure_date, Flight.departure_time).all()
+    return jsonify([f.to_dict() for f in flights])
+
+
+@app.get("/api/flights/<int:flight_id>")
+def get_flight(flight_id: int):
+    """Return a single flight or 404."""
+    flight = db.session.get(Flight, flight_id)
+    if flight is None:
+        from werkzeug.exceptions import NotFound
+        raise NotFound(f"Flight {flight_id} not found.")
+    return jsonify(flight.to_dict())
+
+
+@app.post("/api/flights")
+def create_flight():
+    """Create a new flight."""
+    data = _parse_body()
+    for field in ("flight_number", "origin", "destination", "departure_date"):
+        if not data.get(field):
+            raise ValidationError(f"'{field}' is required.")
+
+    flight = Flight(
+        flight_number=data["flight_number"].upper().strip(),
+        airline=data.get("airline", ""),
+        origin=data["origin"],
+        destination=data["destination"],
+        departure_date=_parse_date(data["departure_date"], "departure_date"),
+        departure_time=data.get("departure_time", ""),
+        arrival_date=_parse_date(data.get("arrival_date"), "arrival_date"),
+        arrival_time=data.get("arrival_time", ""),
+        capacity=int(data.get("capacity") or 150),
+        status=data.get("status", "Scheduled"),
+    )
+    db.session.add(flight)
+    try:
+        db.session.commit()
+    except Exception as exc:
+        db.session.rollback()
+        if "UNIQUE constraint" in str(exc):
+            raise ValidationError(f"Flight number '{data['flight_number']}' already exists.")
+        raise
+    app.logger.info("Created flight id=%s %s", flight.id, flight.flight_number)
+    return jsonify(flight.to_dict()), 201
+
+
+@app.put("/api/flights/<int:flight_id>")
+def update_flight(flight_id: int):
+    """Update an existing flight."""
+    flight = db.session.get(Flight, flight_id)
+    if flight is None:
+        from werkzeug.exceptions import NotFound
+        raise NotFound(f"Flight {flight_id} not found.")
+    data = _parse_body()
+    for field in ("flight_number", "airline", "origin", "destination", "departure_time", "arrival_time", "status"):
+        if field in data:
+            setattr(flight, field, data[field])
+    if "flight_number" in data:
+        flight.flight_number = data["flight_number"].upper().strip()
+    for df in ("departure_date", "arrival_date"):
+        if df in data:
+            setattr(flight, df, _parse_date(data[df], df))
+    if "capacity" in data:
+        flight.capacity = int(data["capacity"] or 150)
+    try:
+        db.session.commit()
+    except Exception as exc:
+        db.session.rollback()
+        if "UNIQUE constraint" in str(exc):
+            raise ValidationError(f"Flight number '{data.get('flight_number')}' already exists.")
+        raise
+    app.logger.info("Updated flight id=%s", flight_id)
+    return jsonify(flight.to_dict())
+
+
+@app.delete("/api/flights/<int:flight_id>")
+def delete_flight(flight_id: int):
+    """Delete a flight and all its assignments."""
+    flight = db.session.get(Flight, flight_id)
+    if flight is None:
+        from werkzeug.exceptions import NotFound
+        raise NotFound(f"Flight {flight_id} not found.")
+    db.session.delete(flight)
+    db.session.commit()
+    app.logger.info("Deleted flight id=%s", flight_id)
+    return "", 204
+
+
+@app.post("/api/flights/<int:flight_id>/travelers/<int:traveler_id>")
+def assign_traveler(flight_id: int, traveler_id: int):
+    """Assign a traveler to a flight."""
+    flight = db.session.get(Flight, flight_id)
+    if flight is None:
+        from werkzeug.exceptions import NotFound
+        raise NotFound(f"Flight {flight_id} not found.")
+    traveler = db.session.get(Traveler, traveler_id)
+    if traveler is None:
+        from werkzeug.exceptions import NotFound
+        raise NotFound(f"Traveler {traveler_id} not found.")
+    if traveler in flight.travelers:
+        raise ValidationError("Traveler is already assigned to this flight.")
+    if len(flight.travelers) >= flight.capacity:
+        raise ValidationError(f"Flight is at full capacity ({flight.capacity} passengers).")
+
+    # Passport expiry check: passport must be valid on the departure date
+    if traveler.passport_expiry:
+        check_date = flight.departure_date or date.today()
+        if traveler.passport_expiry < check_date:
+            raise ValidationError(
+                f"Cannot assign '{traveler.full_name}': passport expired on "
+                f"{traveler.passport_expiry.isoformat()}. "
+                f"A valid passport is required for the departure date ({check_date.isoformat()})."
+            )
+
+    flight.travelers.append(traveler)
+    db.session.commit()
+    app.logger.info("Assigned traveler id=%s to flight id=%s", traveler_id, flight_id)
+    return jsonify(flight.to_dict())
+
+
+@app.delete("/api/flights/<int:flight_id>/travelers/<int:traveler_id>")
+def remove_traveler(flight_id: int, traveler_id: int):
+    """Remove a traveler from a flight."""
+    flight = db.session.get(Flight, flight_id)
+    if flight is None:
+        from werkzeug.exceptions import NotFound
+        raise NotFound(f"Flight {flight_id} not found.")
+    traveler = db.session.get(Traveler, traveler_id)
+    if traveler is None:
+        from werkzeug.exceptions import NotFound
+        raise NotFound(f"Traveler {traveler_id} not found.")
+    if traveler not in flight.travelers:
+        raise ValidationError("Traveler is not assigned to this flight.")
+    flight.travelers.remove(traveler)
+    db.session.commit()
+    app.logger.info("Removed traveler id=%s from flight id=%s", traveler_id, flight_id)
+    return jsonify(flight.to_dict())
+
+
+@app.put("/api/flights/<int:flight_id>/passengers")
+def set_flight_passengers(flight_id: int):
+    """Set the full list of assigned passengers for a flight (batch/confirm endpoint)."""
+    flight = db.session.get(Flight, flight_id)
+    if flight is None:
+        from werkzeug.exceptions import NotFound
+        raise NotFound(f"Flight {flight_id} not found.")
+
+    data = _parse_body()
+    traveler_ids = data.get("traveler_ids", [])
+    if not isinstance(traveler_ids, list):
+        raise ValidationError("'traveler_ids' must be a list of traveler IDs.")
+
+    if len(traveler_ids) > flight.capacity:
+        raise ValidationError(
+            f"Cannot assign {len(traveler_ids)} passengers: flight capacity is {flight.capacity}."
+        )
+
+    check_date = flight.departure_date or date.today()
+    new_travelers = []
+    for tid in traveler_ids:
+        t = db.session.get(Traveler, tid)
+        if t is None:
+            raise ValidationError(f"Traveler with ID {tid} not found.")
+        if t.passport_expiry and t.passport_expiry < check_date:
+            raise ValidationError(
+                f"Cannot assign '{t.full_name}': passport expired on "
+                f"{t.passport_expiry.isoformat()}. "
+                f"A valid passport is required for departure date ({check_date.isoformat()})."
+            )
+        new_travelers.append(t)
+
+    flight.travelers = new_travelers
+    db.session.commit()
+    app.logger.info("Updated flight id=%s passengers: %d assigned", flight_id, len(new_travelers))
+    return jsonify(flight.to_dict())
 
 
 # ---------------------------------------------------------------------------

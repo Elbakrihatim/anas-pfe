@@ -5,12 +5,13 @@ import {
   updateTraveler,
   deleteTraveler,
 } from "./api";
-import { Menu, AlertCircle, CheckCircle2 } from "lucide-react";
+import { Menu, X, AlertCircle, CheckCircle2 } from "lucide-react";
 import Sidebar from "./Sidebar";
 import DashboardPage from "./DashboardPage";
 import TravelerTable from "./TravelerTable";
 import TravelerForm from "./TravelerForm";
 import LogsPage from "./LogsPage";
+import FlightsPage from "./FlightsPage";
 import "./App.css";
 
 /* ── Theme helper ──────────────────────────────────────────────────── */
@@ -112,9 +113,10 @@ export default function App() {
       <button
         className="mobile-toggle"
         onClick={() => setSidebarOpen(!sidebarOpen)}
-        aria-label="Toggle navigation"
+        aria-label={sidebarOpen ? "Close navigation" : "Open navigation"}
+        aria-expanded={sidebarOpen}
       >
-        <Menu size={20} />
+        {sidebarOpen ? <X size={20} /> : <Menu size={20} />}
       </button>
 
       <Sidebar
@@ -168,6 +170,8 @@ export default function App() {
         )}
 
         {page === "logs" && <LogsPage />}
+
+        {page === "flights" && <FlightsPage />}
       </main>
     </div>
   );

@@ -292,7 +292,7 @@ export default function TravelerTable({ travelers, onEdit, onDelete, onAdd }) {
                 <th>Status</th>
                 <th>Contact</th>
                 <th>Visa</th>
-                <th style={{ textAlign: "right", paddingRight: "1.25rem" }}>Actions</th>
+                <th className="actions-header" style={{ textAlign: "right", paddingRight: "1.25rem" }}>Actions</th>
               </tr>
             </thead>
             <tbody>
@@ -384,33 +384,35 @@ export default function TravelerTable({ travelers, onEdit, onDelete, onAdd }) {
                     </td>
 
                     <td className="actions-cell">
-                      <button
-                        type="button"
-                        className="btn btn-sm btn-secondary btn-icon-only"
-                        onClick={() => setSelectedTraveler(t)}
-                        aria-label={`View ${t.full_name}`}
-                        title="View profile"
-                      >
-                        <Eye size={15} />
-                      </button>
-                      <button
-                        type="button"
-                        className="btn btn-sm btn-edit btn-icon-only"
-                        onClick={() => onEdit(t)}
-                        aria-label={`Edit ${t.full_name}`}
-                        title="Edit traveler"
-                      >
-                        <Edit2 size={15} />
-                      </button>
-                      <button
-                        type="button"
-                        className="btn btn-sm btn-delete btn-icon-only"
-                        onClick={() => onDelete(t.id)}
-                        aria-label={`Delete ${t.full_name}`}
-                        title="Delete traveler"
-                      >
-                        <Trash2 size={15} />
-                      </button>
+                      <div className="actions-group">
+                        <button
+                          type="button"
+                          className="btn btn-sm btn-secondary btn-icon-only"
+                          onClick={() => setSelectedTraveler(t)}
+                          aria-label={`View ${t.full_name}`}
+                          title="View profile"
+                        >
+                          <Eye size={15} />
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-sm btn-edit btn-icon-only"
+                          onClick={() => onEdit(t)}
+                          aria-label={`Edit ${t.full_name}`}
+                          title="Edit traveler"
+                        >
+                          <Edit2 size={15} />
+                        </button>
+                        <button
+                          type="button"
+                          className="btn btn-sm btn-delete btn-icon-only"
+                          onClick={() => onDelete(t.id)}
+                          aria-label={`Delete ${t.full_name}`}
+                          title="Delete traveler"
+                        >
+                          <Trash2 size={15} />
+                        </button>
+                      </div>
                     </td>
                   </tr>
                 );

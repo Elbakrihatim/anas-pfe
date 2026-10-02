@@ -272,7 +272,7 @@ def extract_passport_with_gemini(media_content: Any) -> PassportExtraction:
     if os.path.exists(root_env):
         load_dotenv(root_env, override=True)
 
-    api_key = os.environ.get("GEMINI_API_KEY") or "AIzaSyCO_0yS9f3dARRP83kY_XXFWBJjPr1_rjc"
+    api_key = os.environ.get("GEMINI_API_KEY")
     if not api_key:
         raise ValueError(
             "GEMINI_API_KEY is not set. Please add GEMINI_API_KEY to your .env file or environment."
